@@ -5,24 +5,46 @@ import Redlock from 'redlock';
 const prisma = new PrismaClient();
 const redis = new Redis({ host: 'localhost', port: 6379 });
 const redlock = new Redlock([redis], {
-  retryCount: 2,
-  retryDelay: 200,
-  retryJitter: 50,
+  retryCount: 4,
+  retryDelay: 500,
+  retryJitter: 10,
 });
 
 const userId = "test-user-id";
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const formatLocalTime = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, '0');
+  const day = now.getDate().toString().padStart(2, '0');
+  const hours = now.getHours();
+  const minutes = now.getMinutes().toString().padStart(2, '0');
+  const seconds = now.getSeconds().toString().padStart(2, '0');
+  const milliseconds = now.getMilliseconds().toString().padStart(3, '0');
+  const period = hours >= 12 ? 'PM' : 'AM';
+  const adjustedHours = (hours % 12 || 12).toString().padStart(2, '0');
+  return `${year}-${month}-${day} ${adjustedHours}:${minutes}:${seconds}.${milliseconds} ${period}`;
+};
+
+const logWithTimestamp = (message: string) => {
+  const timestamp = formatLocalTime();
+  const blue = '\x1b[34m';
+  const green = '\x1b[32m';
+  const reset = '\x1b[0m';
+  console.log(`${blue}[${timestamp}]${reset} ${green}${message}${reset}`);
+};
+
 const cleanupDatabase = async () => {
-  console.log("Cleaning up database...");
+  logWithTimestamp("Cleaning up database...");
   await prisma.job.deleteMany({});
   await prisma.user.deleteMany({});
-  console.log("Database cleaned up.");
+  logWithTimestamp("Database cleaned up.");
 };
 
 const initializeUser = async () => {
-  console.log("Initializing user...");
+  logWithTimestamp("Initializing user...");
   await prisma.user.upsert({
     where: { id: userId },
     update: {},
@@ -32,17 +54,24 @@ const initializeUser = async () => {
       balance: 100,
     },
   });
-  console.log("User initialized.");
+  logWithTimestamp("User initialized with balance: 100");
 };
 
-const createJobWithLock = async (userId: string, jobTitle: string, cost: number, useRowLock: boolean = true, processingTime: number = 1000): Promise<void> => {
+const createJobWithLock = async (
+  userId: string, 
+  jobTitle: string, 
+  cost: number, 
+  useRowLock: boolean = true, 
+  processingTime: number = 1000
+): Promise<void> => {
+  logWithTimestamp(`[${jobTitle}] Starting transaction`);
   return await prisma.$transaction(async (prisma) => {
     if (useRowLock) {
-      console.log(`[${jobTitle}] Attempting to lock user ${userId}...`);
+      logWithTimestamp(`[${jobTitle}] Attempting to acquire row lock for user ${userId}...`);
       await prisma.$executeRaw`SELECT * FROM "User" WHERE id = ${userId} FOR UPDATE`;
-      console.log(`[${jobTitle}] User ${userId} locked.`);
+      logWithTimestamp(`[${jobTitle}] Row lock acquired for user ${userId}.`);
     } else {
-      console.log(`[${jobTitle}] Skipping row lock.`);
+      logWithTimestamp(`[${jobTitle}] Skipping row lock.`);
     }
 
     const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -50,11 +79,13 @@ const createJobWithLock = async (userId: string, jobTitle: string, cost: number,
       throw new Error('User not found');
     }
 
+    logWithTimestamp(`[${jobTitle}] Current balance: ${user.balance}`);
+
     if (cost > user.balance) {
       throw new Error('Not enough balance');
     }
 
-    console.log(`[${jobTitle}] Processing...`);
+    logWithTimestamp(`[${jobTitle}] Processing...`);
     await wait(processingTime);
 
     await prisma.user.update({
@@ -69,14 +100,20 @@ const createJobWithLock = async (userId: string, jobTitle: string, cost: number,
       },
     });
 
-    console.log(`[${jobTitle}] Job created and balance updated.`);
+    const updatedUser = await prisma.user.findUnique({ where: { id: userId } });
+    logWithTimestamp(`[${jobTitle}] Job created and balance updated. New balance: ${updatedUser?.balance}`);
   }, {
-    timeout: 5000
+    timeout: 5500
+  }).then(() => {
+    logWithTimestamp(`[${jobTitle}] Transaction completed successfully`);
+  }).catch((error) => {
+    logWithTimestamp(`[${jobTitle}] Transaction failed: ${error}`);
+    throw error;
   });
 };
 
 const scenario1 = async () => {
-  console.log("\nScenario 1: Successful Lock and Transaction");
+  logWithTimestamp("Scenario 1: Successful Lock and Transaction");
   await cleanupDatabase();
   await initializeUser();
 
@@ -84,20 +121,20 @@ const scenario1 = async () => {
 
   try {
     const lock = await redlock.acquire([resource], 5000);
-    console.log("Redlock acquired for Scenario 1");
+    logWithTimestamp("Redlock acquired for Scenario 1");
     try {
       await createJobWithLock(userId, "Job 1", 30);
     } finally {
       await lock.release();
-      console.log("Redlock released for Scenario 1");
+      logWithTimestamp("Redlock released for Scenario 1");
     }
   } catch (error) {
-    console.error("Error in Scenario 1:", error);
+    logWithTimestamp(`Error in Scenario 1: ${error}`);
   }
 };
 
 const scenario2 = async () => {
-  console.log("\nScenario 2: Redlock Contention");
+  logWithTimestamp("Scenario 2: Redlock Contention");
   await cleanupDatabase();
   await initializeUser();
 
@@ -106,30 +143,30 @@ const scenario2 = async () => {
   const job1 = async () => {
     try {
       const lock = await redlock.acquire([resource], 3000);
-      console.log("Redlock acquired for Job 1");
+      logWithTimestamp("Redlock acquired for Job 1");
       try {
         await createJobWithLock(userId, "Job 2.1", 20, true, 2000);
       } finally {
         await lock.release();
-        console.log("Redlock released for Job 1");
+        logWithTimestamp("Redlock released for Job 1");
       }
     } catch (error) {
-      console.error("Error in Job 1:", error);
+      logWithTimestamp(`Error in Job 1: ${error}`);
     }
   };
 
   const job2 = async () => {
     try {
       const lock = await redlock.acquire([resource], 3000);
-      console.log("Redlock acquired for Job 2");
+      logWithTimestamp("Redlock acquired for Job 2");
       try {
         await createJobWithLock(userId, "Job 2.2", 30, true, 1000);
       } finally {
         await lock.release();
-        console.log("Redlock released for Job 2");
+        logWithTimestamp("Redlock released for Job 2");
       }
     } catch (error) {
-      console.error("Error in Job 2:", error);
+      logWithTimestamp(`Error in Job 2: ${error}`);
     }
   };
 
@@ -137,30 +174,73 @@ const scenario2 = async () => {
 };
 
 const scenario3 = async () => {
-  console.log("\nScenario 3: Prisma Transaction Timeout");
+  logWithTimestamp("Scenario 3: Prisma Transaction Timeout");
   await cleanupDatabase();
   await initializeUser();
 
   try {
-    await createJobWithLock(userId, "Job 3", 30, true, 6000); // Set processing time longer than transaction timeout
+    await createJobWithLock(userId, "Job 3", 30, true, 5600); // Set processing time longer than transaction timeout
   } catch (error) {
-    console.error("Error in Scenario 3 (Expected timeout):", error);
+    logWithTimestamp(`Error in Scenario 3 (Expected timeout): ${error}`);
   }
 };
 
-const scenario4 = async () => {
-  console.log("\nScenario 4: Row-Level Lock vs No Lock");
+const scenario4a = async () => {
+  logWithTimestamp("Scenario 4A: Both jobs with row locks");
   await cleanupDatabase();
   await initializeUser();
 
-  const job1 = createJobWithLock(userId, "Job 4.1", 20, true, 2000);
-  const job2 = createJobWithLock(userId, "Job 4.2", 30, false, 1000);
+  const job1 = createJobWithLock(userId, "Job 4A.1", 20, true, 1400);
+  const job2 = createJobWithLock(userId, "Job 4A.2", 30, true, 1200);
 
   await Promise.all([job1, job2]);
 };
 
+const scenario4b = async () => {
+  logWithTimestamp("Scenario 4B: First job with row lock, second without");
+  await cleanupDatabase();
+  await initializeUser();
+
+  const job1 = createJobWithLock(userId, "Job 4B.1", 20, true, 1400);
+  const job2 = createJobWithLock(userId, "Job 4B.2", 30, false, 1200);
+
+  await Promise.all([job1, job2]);
+};
+
+const scenario4c = async () => {
+  logWithTimestamp("Scenario 4C: Both jobs without row locks");
+  await cleanupDatabase();
+  await initializeUser();
+
+  const job1 = createJobWithLock(userId, "Job 4C.1", 20, false, 1400);
+  const job2 = createJobWithLock(userId, "Job 4C.2", 30, false, 1200);
+
+  await Promise.all([job1, job2]);
+};
+
+const scenario4d = async () => {
+  logWithTimestamp("Scenario 4D: Sequential execution with row locks");
+  await cleanupDatabase();
+  await initializeUser();
+
+  await createJobWithLock(userId, "Job 4D.1", 20, true, 1400);
+  await createJobWithLock(userId, "Job 4D.2", 30, true, 1200);
+};
+
+const scenario4e = async () => {
+  logWithTimestamp("Scenario 4E: Three concurrent jobs with varying lock usage");
+  await cleanupDatabase();
+  await initializeUser();
+
+  const job1 = createJobWithLock(userId, "Job 4E.1", 20, true, 1000);
+  const job2 = createJobWithLock(userId, "Job 4E.2", 23, true, 2000);
+  const job3 = createJobWithLock(userId, "Job 4E.3", 10, true, 1000);
+
+  await Promise.all([job1, job2, job3]);
+};
+
 const scenario5 = async () => {
-  console.log("\nScenario 5: Optimistic Concurrency Control");
+  logWithTimestamp("Scenario 5: Optimistic Concurrency Control");
   await cleanupDatabase();
   await initializeUser();
 
@@ -170,6 +250,7 @@ const scenario5 = async () => {
         const user = await prisma.user.findUnique({ where: { id: userId } });
         if (!user) throw new Error('User not found');
 
+        logWithTimestamp(`Updating balance by ${amount}. Current balance: ${user.balance}`);
         await wait(1000); // Simulate some processing time
 
         const updatedUser = await prisma.user.update({
@@ -177,10 +258,10 @@ const scenario5 = async () => {
           data: { balance: user.balance + amount },
         });
 
-        console.log(`Balance updated: ${updatedUser.balance}`);
+        logWithTimestamp(`Balance updated: ${updatedUser.balance}`);
       });
     } catch (error) {
-      console.error("Error updating balance:", error);
+      logWithTimestamp(`Error updating balance: ${error}`);
     }
   };
 
@@ -195,7 +276,11 @@ const runScenarios = async () => {
   await scenario1();
   await scenario2();
   await scenario3();
-  await scenario4();
+  await scenario4a();
+  await scenario4b();
+  await scenario4c();
+  await scenario4d();
+  await scenario4e();
   await scenario5();
 };
 
